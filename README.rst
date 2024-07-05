@@ -72,3 +72,11 @@ Kernel logs can be viewed like this::
     [  257.533332] ftrace_hook: execve() before: /sbin/rmmod
     [  257.533714] ftrace_hook: execve() after: 0
     [  257.560086] ftrace_hook: module unloaded
+
+extra
+-----
+build user program and run ::
+
+    $ go build main.go
+
+    $ ./main

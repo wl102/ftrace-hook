@@ -1,3 +1,5 @@
+//go build: ignore
+
 /*
  * Hooking kernel functions using ftrace framework
  *
@@ -15,10 +17,143 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/kprobes.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+#include <linux/init.h>
+#include <linux/types.h>
+#include <net/sock.h>
+#include <net/netlink.h>
+#include <linux/wait.h>
 
 MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
-MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com>");
+MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com> wangzhen <wangzhen_1221@163.com>");
 MODULE_LICENSE("GPL");
+
+#define NETLINK_TEST 25
+#define MAX_MSGSIZE 1024
+int stringlength(char *s);
+
+static DECLARE_COMPLETION(msg_received);
+static uint32_t msg_seq = 0;
+static uint32_t ENABLE = 0; 
+
+struct sock *nl_sk = NULL;
+
+/**
+ * sec 3
+ */
+#define MAX_MSGS 1024
+
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+static int flag = 0;
+static spinlock_t lock;
+
+struct msg_info {
+    int seqid;
+    char *payload;
+};
+static struct msg_info msg_buffer[MAX_MSGS];
+
+//向用户态进程回发消息
+static int sendnlmsg(char *message, int pid)
+{
+    struct sk_buff *skb_1;
+    struct nlmsghdr *nlh;
+    int len = NLMSG_SPACE(MAX_MSGSIZE);
+    int slen = 0;
+	int sqid, head;
+    if(!message || !nl_sk)
+    {
+        return -1;
+    }
+    printk(KERN_ERR "pid:%d\n",pid);
+    skb_1 = alloc_skb(len,GFP_KERNEL);
+    if(!skb_1)
+    {
+        printk(KERN_ERR "my_net_link:alloc_skb error\n");
+    }
+    slen = stringlength(message);
+    nlh = nlmsg_put(skb_1,0,0,NLMSG_DONE,MAX_MSGSIZE,0);
+    NETLINK_CB(skb_1).portid = 0;
+    NETLINK_CB(skb_1).dst_group = 0;
+    message[slen]= '\0';
+
+    // 设置唯一的seqid
+	msg_seq++;
+    nlh->nlmsg_seq = msg_seq;
+	sqid = msg_seq;
+    memcpy(NLMSG_DATA(nlh),message,slen+1);
+    printk("my_net_link:send message '%s' %d.\n",(char *)NLMSG_DATA(nlh), sqid);
+	// 发送消息
+    netlink_unicast(nl_sk,skb_1,pid,MSG_DONTWAIT);
+
+    // 如何检测程序准备就绪，才开始等待用户态的响应
+	if (ENABLE) {
+		// 等待接收消息回调
+		wait_event_interruptible(wq, flag != 0);
+		head = sqid % MAX_MSGS;
+		spin_lock(&lock);
+		flag = 0;
+		// 从缓冲区读取接收到的seqid
+		if (msg_buffer[head].seqid != sqid) {
+			pr_info("head is:%d seqid not equal: %d!=%d\n", head,msg_buffer[head].seqid,sqid);
+		}
+		if (strcmp(msg_buffer[head].payload, "0") == 0 && msg_buffer[head].seqid == sqid) {
+			spin_unlock(&lock);
+			return 1;
+		}
+		spin_unlock(&lock);
+	}
+	return 0;
+}
+int stringlength(char *s)
+{
+    int slen = 0;
+    for(; *s; s++)
+    {
+        slen++;
+    }
+    return slen;
+}
+//接收用户态发来的消息
+void nl_data_ready(struct sk_buff *__skb)
+{
+	struct sk_buff *skb;
+	struct nlmsghdr *nlh;
+	char str[10];
+	//int pid;
+	//printk("begin data_ready\n");
+	skb = skb_get(__skb);
+	if(skb->len >= NLMSG_SPACE(0))
+	{
+		nlh = nlmsg_hdr(skb);
+		memcpy(str, NLMSG_DATA(nlh), sizeof(str));
+		//启用
+		if (strcmp(str, "2") == 0) {
+			ENABLE = 1;
+		}
+		//退出
+		if (strcmp(str, "3") == 0) {
+			ENABLE = 0;
+		}
+		printk("Message received:%d,%s\n",nlh->nlmsg_seq, str) ;
+		//pid = nlh->nlmsg_pid;
+		
+		if (ENABLE) {
+			spin_lock(&lock);
+			msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].seqid = nlh->nlmsg_seq;
+			memcpy(msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload, str, 8);
+			pr_info("set seq status:%d,%s\n", msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].seqid, msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload);
+			// 设置标志
+			flag = 1;
+			spin_unlock(&lock);
+			// 唤醒等待队列
+			wake_up_interruptible(&wq);
+		}
+
+		kfree_skb(skb);
+	}
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,7,0)
 static unsigned long lookup_name(const char *name)
@@ -103,6 +238,15 @@ static int fh_resolve_hook_address(struct ftrace_hook *hook)
 
 	return 0;
 }
+
+
+/**
+ *  centos7 need declate this function with manual
+ */
+/*static inline bool within_module(unsigned long addr, const struct module *mod)
+{
+	return within_module_init(addr, mod) || within_module_core(addr, mod);
+}*/
 
 static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
 		struct ftrace_ops *ops, struct ftrace_regs *fregs)
@@ -297,11 +441,64 @@ static asmlinkage long fh_sys_execve(struct pt_regs *regs)
 {
 	long ret;
 	char *kernel_filename;
+    struct path path;
+    char *buf;
+    char *absolute_path;
+    int buflen = 512;
 
 	kernel_filename = duplicate_filename((void*) regs->di);
 
 	pr_info("execve() before: %s\n", kernel_filename);
 
+    // 将文件名转换为路径
+    ret = kern_path(kernel_filename, LOOKUP_FOLLOW, &path);
+    if (ret)
+    {
+        pr_err("kern_path failed\n");
+        kfree(kernel_filename);
+        return ret;
+    }
+
+    // 分配一个缓冲区来存储绝对路径
+    buf = kmalloc(buflen, GFP_KERNEL);
+    if (!buf)
+    {
+        pr_err("kmalloc for buf failed\n");
+        path_put(&path);
+        kfree(kernel_filename);
+        return -ENOMEM;
+    }
+
+    // 获取绝对路径
+    absolute_path = d_path(&path, buf, buflen);
+    if (IS_ERR(absolute_path))
+    {
+        pr_err("d_path failed\n");
+        kfree(buf);
+        path_put(&path);
+        kfree(kernel_filename);
+        return PTR_ERR(absolute_path);
+    }
+
+    // 打印绝对路径
+    pr_info("execve() absolute path: %s\n", absolute_path);
+
+    /**
+     * check md5, if ok; goto real_sys_execve else return
+     */
+	ret = sendnlmsg(absolute_path, 100);
+    if (ret) {
+        pr_err("Failed to get response from user space\n");
+		pr_info("execve() hooked: %ld\n", ret);
+        kfree(buf);
+        path_put(&path);
+        kfree(kernel_filename);
+        return -ret;
+    }
+
+    // 清理工作
+    kfree(buf);
+    path_put(&path);
 	kfree(kernel_filename);
 
 	ret = real_sys_execve(regs);
@@ -321,12 +518,62 @@ static asmlinkage long fh_sys_execve(const char __user *filename,
 {
 	long ret;
 	char *kernel_filename;
+	struct path path;
+    char *buf;
+    char *absolute_path;
+    int buflen = 256;
 
+	// Duplicate the filename from userspace to kernel space
 	kernel_filename = duplicate_filename(filename);
+	if (!kernel_filename)
+        return -ENOMEM;
 
 	pr_info("execve() before: %s\n", kernel_filename);
 
-	kfree(kernel_filename);
+    // Convert the filename to a path
+    ret = kern_path(kernel_filename, LOOKUP_FOLLOW, &path);
+    if (ret)
+    {
+        pr_err("kern_path failed\n");
+        kfree(kernel_filename);
+        return ret;
+    }
+
+    // Allocate a buffer to store the absolute path
+    buf = kmalloc(buflen, GFP_KERNEL);
+    if (!buf)
+    {
+        pr_err("kmalloc for buf failed\n");
+        path_put(&path);
+        kfree(kernel_filename);
+        return -ENOMEM;
+    }
+
+    // Get the absolute path
+    absolute_path = d_path(&path, buf, buflen);
+    if (IS_ERR(absolute_path))
+    {
+        pr_err("d_path failed\n");
+        kfree(buf);
+        path_put(&path);
+        kfree(kernel_filename);
+        return PTR_ERR(absolute_path);
+    }
+
+    // Print the absolute path
+    pr_info("execve() absolute path: %s\n", absolute_path);
+
+    // Clean up
+    kfree(buf);
+    path_put(&path);
+    kfree(kernel_filename);
+
+    /**
+     * check md5, if ok; goto real_sys_execve else return
+     */
+	// netlink
+	// 
+	// 
 
 	ret = real_sys_execve(filename, argv, envp);
 
@@ -354,13 +601,17 @@ static asmlinkage long fh_sys_execve(const char __user *filename,
 	}
 
 static struct ftrace_hook demo_hooks[] = {
-	HOOK("sys_clone",  fh_sys_clone,  &real_sys_clone),
+	//HOOK("sys_clone",  fh_sys_clone,  &real_sys_clone),
 	HOOK("sys_execve", fh_sys_execve, &real_sys_execve),
 };
 
 static int fh_init(void)
 {
 	int err;
+	int i =0;
+	struct netlink_kernel_cfg cfg = {
+        .input = nl_data_ready,
+    };
 
 	err = fh_install_hooks(demo_hooks, ARRAY_SIZE(demo_hooks));
 	if (err)
@@ -368,6 +619,19 @@ static int fh_init(void)
 
 	pr_info("module loaded\n");
 
+	// 手动初始化 msg_buffer
+    for (; i < MAX_MSGS; i++) {
+        msg_buffer[i].seqid = i;
+        //memset(msg_buffer[i].payload, 0, sizeof(msg_buffer[i].payload));
+		msg_buffer[i].payload = kmalloc(8, GFP_KERNEL);
+    }
+
+    nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &cfg);
+    if(!nl_sk){
+        printk(KERN_ERR "my_net_link: create netlink socket error.\n");
+        return 1;
+    }
+    printk("my_net_link_4: create netlink socket ok.\n");
 	return 0;
 }
 module_init(fh_init);
@@ -377,5 +641,15 @@ static void fh_exit(void)
 	fh_remove_hooks(demo_hooks, ARRAY_SIZE(demo_hooks));
 
 	pr_info("module unloaded\n");
+    if (nl_sk) {
+        netlink_kernel_release(nl_sk);
+    }
+	// 手动释放 msg_buffer
+    // for (; i < MAX_MSGS; i++) {
+    //     msg_buffer[i].seqid = i;
+    //     //memset(msg_buffer[i].payload, 0, sizeof(msg_buffer[i].payload));
+	// 	msg_buffer[i].payload = kmalloc(8, GFP_KERNEL);
+    // }
+    printk("my_net_link: self module exited\n");
 }
 module_exit(fh_exit);
