@@ -23,10 +23,10 @@
 #include <linux/types.h>
 #include <net/sock.h>
 #include <net/netlink.h>
-#include <linux/wait.h>
+//#include <linux/wait.h>
 
 MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
-MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com> wangzhen <wangzhen_1221@163.com>");
+MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com> wangzhen <wanglian.163.com>");
 MODULE_LICENSE("GPL");
 
 #define NETLINK_TEST 25
@@ -44,13 +44,14 @@ struct sock *nl_sk = NULL;
  */
 #define MAX_MSGS 1024
 
-static DECLARE_WAIT_QUEUE_HEAD(wq);
-static int flag = 0;
+//static DECLARE_WAIT_QUEUE_HEAD(wq);
+//static int flag = 0;
 static spinlock_t lock;
 
 struct msg_info {
     int seqid;
     char *payload;
+	struct completion comp;
 };
 static struct msg_info msg_buffer[MAX_MSGS];
 
@@ -90,13 +91,25 @@ static int sendnlmsg(char *message, int pid)
     // 如何检测程序准备就绪，才开始等待用户态的响应
 	if (ENABLE) {
 		// 等待接收消息回调
-		wait_event_interruptible(wq, flag != 0);
+		//wait_event_interruptible(wq, flag != 0);
 		head = sqid % MAX_MSGS;
+
+		// spin_lock(&lock);
+        // init_completion(&msg_buffer[head].comp);
+        // spin_unlock(&lock);
+
+		//等待消息完成
+		//wait_for_completion(&msg_buffer[head].comp);
+		if (!wait_for_completion_interruptible_timeout(&msg_buffer[head].comp, msecs_to_jiffies(200))) {
+			return 1;
+		}
+		
 		spin_lock(&lock);
-		flag = 0;
+		//flag = 0;
 		// 从缓冲区读取接收到的seqid
 		if (msg_buffer[head].seqid != sqid) {
 			pr_info("head is:%d seqid not equal: %d!=%d\n", head,msg_buffer[head].seqid,sqid);
+			return 1;
 		}
 		if (strcmp(msg_buffer[head].payload, "0") == 0 && msg_buffer[head].seqid == sqid) {
 			spin_unlock(&lock);
@@ -131,10 +144,12 @@ void nl_data_ready(struct sk_buff *__skb)
 		//启用
 		if (strcmp(str, "2") == 0) {
 			ENABLE = 1;
+			return;
 		}
 		//退出
 		if (strcmp(str, "3") == 0) {
 			ENABLE = 0;
+			return;
 		}
 		printk("Message received:%d,%s\n",nlh->nlmsg_seq, str) ;
 		//pid = nlh->nlmsg_pid;
@@ -145,10 +160,11 @@ void nl_data_ready(struct sk_buff *__skb)
 			memcpy(msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload, str, 8);
 			pr_info("set seq status:%d,%s\n", msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].seqid, msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload);
 			// 设置标志
-			flag = 1;
+			//flag = 1;
+			complete(&msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].comp);
 			spin_unlock(&lock);
 			// 唤醒等待队列
-			wake_up_interruptible(&wq);
+			//wake_up_interruptible(&wq);
 		}
 
 		kfree_skb(skb);
@@ -563,17 +579,24 @@ static asmlinkage long fh_sys_execve(const char __user *filename,
     // Print the absolute path
     pr_info("execve() absolute path: %s\n", absolute_path);
 
-    // Clean up
-    kfree(buf);
-    path_put(&path);
-    kfree(kernel_filename);
-
     /**
      * check md5, if ok; goto real_sys_execve else return
      */
 	// netlink
-	// 
-	// 
+	ret = sendnlmsg(absolute_path, 100);
+    if (ret) {
+        pr_err("Failed to get response from user space\n");
+		pr_info("execve() hooked: %ld\n", ret);
+        kfree(buf);
+        path_put(&path);
+        kfree(kernel_filename);
+        return -ret;
+    }
+
+	// Clean up
+    kfree(buf);
+    path_put(&path);
+    kfree(kernel_filename);
 
 	ret = real_sys_execve(filename, argv, envp);
 
@@ -624,6 +647,7 @@ static int fh_init(void)
         msg_buffer[i].seqid = i;
         //memset(msg_buffer[i].payload, 0, sizeof(msg_buffer[i].payload));
 		msg_buffer[i].payload = kmalloc(8, GFP_KERNEL);
+		init_completion(&msg_buffer[i].comp);
     }
 
     nl_sk = netlink_kernel_create(&init_net, NETLINK_TEST, &cfg);
@@ -638,18 +662,17 @@ module_init(fh_init);
 
 static void fh_exit(void)
 {
+	int i;
 	fh_remove_hooks(demo_hooks, ARRAY_SIZE(demo_hooks));
 
 	pr_info("module unloaded\n");
     if (nl_sk) {
         netlink_kernel_release(nl_sk);
     }
-	// 手动释放 msg_buffer
-    // for (; i < MAX_MSGS; i++) {
-    //     msg_buffer[i].seqid = i;
-    //     //memset(msg_buffer[i].payload, 0, sizeof(msg_buffer[i].payload));
-	// 	msg_buffer[i].payload = kmalloc(8, GFP_KERNEL);
-    // }
+	
+    for (i = 0; i < MAX_MSGS; i++) {
+        kfree(msg_buffer[i].payload);
+    }
     printk("my_net_link: self module exited\n");
 }
 module_exit(fh_exit);
