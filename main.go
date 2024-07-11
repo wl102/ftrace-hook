@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -64,7 +63,7 @@ func main() {
 			for _, m := range msgs {
 				seq := m.Header.Sequence
 				// 去掉 '\0' char
-				path := string(bytes.TrimRight(m.Data, "\x00"))
+				path := string(TrimNullChar(m.Data))
 				fmt.Printf("Received path from kernel: %s, Seq:%d\n", path, seq)
 
 				// 判断文件是否安全
@@ -104,4 +103,13 @@ func main() {
 func checkFileSafety(path string) bool {
 	// 在这里实现判断逻辑
 	return path != "/home/kolla/hello_world/main"
+}
+
+func TrimNullChar(data []byte) []byte {
+	for i := 0; i < len(data); i++ {
+		if data[i] == 0x00 {
+			return data[:i]
+		}
+	}
+	return data
 }
