@@ -539,7 +539,7 @@ static asmlinkage long fh_sys_execve(const char __user *filename,
 	struct path path;
     char *buf;
     char *absolute_path;
-    int buflen = 256;
+    int buflen = 512;
 
 	// Duplicate the filename from userspace to kernel space
 	kernel_filename = duplicate_filename(filename);
