@@ -259,10 +259,12 @@ static int fh_resolve_hook_address(struct ftrace_hook *hook)
 /**
  *  centos7 need declate this function with manual
  */
-/*static inline bool within_module(unsigned long addr, const struct module *mod)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,16,0)
+static inline bool within_module(unsigned long addr, const struct module *mod)
 {
 	return within_module_init(addr, mod) || within_module_core(addr, mod);
-}*/
+}
+#endif
 
 static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
 		struct ftrace_ops *ops, struct ftrace_regs *fregs)

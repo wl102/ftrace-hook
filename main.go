@@ -95,7 +95,7 @@ func main() {
 		fmt.Println("\ninterrupt")
 		return
 	case <-exit:
-		fmt.Println("exit")
+		fmt.Println("\nexit")
 		return
 	}
 }
