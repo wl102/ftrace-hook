@@ -101,7 +101,7 @@ static int sendnlmsg(char *message, int pid)
 		//等待消息完成
 		//wait_for_completion(&msg_buffer[head].comp);
 		if (!wait_for_completion_interruptible_timeout(&msg_buffer[head].comp, msecs_to_jiffies(200))) {
-			return 1;
+			return 0;
 		}
 		
 		spin_lock(&lock);

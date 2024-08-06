@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/mdlayher/netlink"
 )
@@ -19,6 +20,10 @@ func main() {
 		log.Fatalf("failed to dial netlink: %v", err)
 	}
 	defer c.Close()
+	rcvbuf := 1024 * 1024
+	if err := c.SetReadBuffer(rcvbuf); err != nil {
+		log.Fatalf("failed to set receive buffer size: %v", err)
+	}
 
 	//退出
 	defer func() {
@@ -34,7 +39,7 @@ func main() {
 	}()
 	interrupt := make(chan os.Signal, 1)
 	exit := make(chan struct{}, 1)
-	signal.Notify(interrupt, os.Interrupt, os.Kill)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
 	//启用
 	if _, err := c.Send(netlink.Message{
