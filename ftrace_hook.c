@@ -24,6 +24,7 @@
 #include <net/sock.h>
 #include <net/netlink.h>
 //#include <linux/wait.h>
+#include <linux/completion.h>
 
 MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
 MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com> wangzhen <wanglian.163.com>");
