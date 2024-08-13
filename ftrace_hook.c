@@ -23,8 +23,9 @@
 #include <linux/types.h>
 #include <net/sock.h>
 #include <net/netlink.h>
-//#include <linux/wait.h>
 #include <linux/completion.h>
+#include <linux/mutex.h>
+
 
 MODULE_DESCRIPTION("Example module hooking clone() and execve() via ftrace");
 MODULE_AUTHOR("ilammy <a.lozovsky@gmail.com> wangzhen <wanglian.163.com>");
@@ -45,9 +46,7 @@ struct sock *nl_sk = NULL;
  */
 #define MAX_MSGS 1024
 
-//static DECLARE_WAIT_QUEUE_HEAD(wq);
-//static int flag = 0;
-static spinlock_t lock;
+static DEFINE_MUTEX(my_mutex);
 
 struct msg_info {
     int seqid;
@@ -91,32 +90,24 @@ static int sendnlmsg(char *message, int pid)
 
     // 如何检测程序准备就绪，才开始等待用户态的响应
 	if (ENABLE) {
-		// 等待接收消息回调
-		//wait_event_interruptible(wq, flag != 0);
 		head = sqid % MAX_MSGS;
 
-		// spin_lock(&lock);
-        // init_completion(&msg_buffer[head].comp);
-        // spin_unlock(&lock);
-
-		//等待消息完成
-		//wait_for_completion(&msg_buffer[head].comp);
 		if (!wait_for_completion_interruptible_timeout(&msg_buffer[head].comp, msecs_to_jiffies(200))) {
 			return 0;
 		}
 		
-		spin_lock(&lock);
-		//flag = 0;
+		mutex_lock(&my_mutex);
 		// 从缓冲区读取接收到的seqid
 		if (msg_buffer[head].seqid != sqid) {
 			pr_info("head is:%d seqid not equal: %d!=%d\n", head,msg_buffer[head].seqid,sqid);
+			mutex_unlock(&my_mutex);
 			return 1;
 		}
 		if (strcmp(msg_buffer[head].payload, "0") == 0 && msg_buffer[head].seqid == sqid) {
-			spin_unlock(&lock);
+			mutex_unlock(&my_mutex);
 			return 1;
 		}
-		spin_unlock(&lock);
+		mutex_unlock(&my_mutex);
 	}
 	return 0;
 }
@@ -135,8 +126,7 @@ void nl_data_ready(struct sk_buff *__skb)
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
 	char str[10];
-	//int pid;
-	//printk("begin data_ready\n");
+
 	skb = skb_get(__skb);
 	if(skb->len >= NLMSG_SPACE(0))
 	{
@@ -152,20 +142,16 @@ void nl_data_ready(struct sk_buff *__skb)
 			ENABLE = 0;
 			return;
 		}
-		printk("Message received:%d,%s\n",nlh->nlmsg_seq, str) ;
-		//pid = nlh->nlmsg_pid;
-		
+		printk("Message received:%d,%s\n",nlh->nlmsg_seq, str) ;		
 		if (ENABLE) {
-			spin_lock(&lock);
+			mutex_lock(&my_mutex);
+
 			msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].seqid = nlh->nlmsg_seq;
 			memcpy(msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload, str, 8);
 			pr_info("set seq status:%d,%s\n", msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].seqid, msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].payload);
-			// 设置标志
-			//flag = 1;
 			complete(&msg_buffer[(nlh->nlmsg_seq % MAX_MSGS)].comp);
-			spin_unlock(&lock);
-			// 唤醒等待队列
-			//wake_up_interruptible(&wq);
+
+			mutex_unlock(&my_mutex);
 		}
 
 		kfree_skb(skb);
