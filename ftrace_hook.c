@@ -39,12 +39,12 @@ static DECLARE_COMPLETION(msg_received);
 static uint32_t msg_seq = 0;
 static uint32_t ENABLE = 0; 
 
-struct sock *nl_sk = NULL;
+static struct sock *nl_sk = NULL;
 
 /**
  * sec 3
  */
-#define MAX_MSGS 1024
+#define MAX_MSGS 10240
 
 static DEFINE_MUTEX(my_mutex);
 
@@ -58,6 +58,7 @@ static struct msg_info msg_buffer[MAX_MSGS];
 //向用户态进程回发消息
 static int sendnlmsg(char *message, int pid)
 {
+	static int timeout_count;
     struct sk_buff *skb_1;
     struct nlmsghdr *nlh;
     int len = NLMSG_SPACE(MAX_MSGSIZE);
@@ -67,7 +68,6 @@ static int sendnlmsg(char *message, int pid)
     {
         return -1;
     }
-    printk(KERN_ERR "pid:%d\n",pid);
     skb_1 = alloc_skb(len,GFP_KERNEL);
     if(!skb_1)
     {
@@ -93,6 +93,15 @@ static int sendnlmsg(char *message, int pid)
 		head = sqid % MAX_MSGS;
 
 		if (!wait_for_completion_interruptible_timeout(&msg_buffer[head].comp, msecs_to_jiffies(200))) {
+			// 5次超时就关闭
+			timeout_count++;
+			if (timeout_count > 5) {
+				mutex_lock(&my_mutex);
+				ENABLE = 0;
+				timeout_count = 0;
+				mutex_unlock(&my_mutex);
+				pr_info("wait timeout 5 times, disabled");
+			}
 			return 0;
 		}
 		
@@ -101,7 +110,7 @@ static int sendnlmsg(char *message, int pid)
 		if (msg_buffer[head].seqid != sqid) {
 			pr_info("head is:%d seqid not equal: %d!=%d\n", head,msg_buffer[head].seqid,sqid);
 			mutex_unlock(&my_mutex);
-			return 1;
+			return 0;
 		}
 		if (strcmp(msg_buffer[head].payload, "0") == 0 && msg_buffer[head].seqid == sqid) {
 			mutex_unlock(&my_mutex);
@@ -121,7 +130,7 @@ int stringlength(char *s)
     return slen;
 }
 //接收用户态发来的消息
-void nl_data_ready(struct sk_buff *__skb)
+static void nl_data_ready(struct sk_buff *__skb)
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
@@ -273,7 +282,7 @@ static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
  *
  * Returns: zero on success, negative error code otherwise.
  */
-int fh_install_hook(struct ftrace_hook *hook)
+static int fh_install_hook(struct ftrace_hook *hook)
 {
 	int err;
 
@@ -312,7 +321,7 @@ int fh_install_hook(struct ftrace_hook *hook)
  * fh_remove_hooks() - disable and unregister a single hook
  * @hook: a hook to remove
  */
-void fh_remove_hook(struct ftrace_hook *hook)
+static void fh_remove_hook(struct ftrace_hook *hook)
 {
 	int err;
 
@@ -336,7 +345,7 @@ void fh_remove_hook(struct ftrace_hook *hook)
  *
  * Returns: zero on success, negative error code otherwise.
  */
-int fh_install_hooks(struct ftrace_hook *hooks, size_t count)
+static int fh_install_hooks(struct ftrace_hook *hooks, size_t count)
 {
 	int err;
 	size_t i;
@@ -362,7 +371,7 @@ error:
  * @hooks: array of hooks to remove
  * @count: number of hooks to remove
  */
-void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
+static void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
 {
 	size_t i;
 
